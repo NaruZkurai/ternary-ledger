@@ -1,0 +1,13 @@
+[package]
+name = "ternary-ledger"
+version = "0.1.0"
+edition = "2021"
+description = "Dynamic compressed-token ledger for the pi harness: mints ternarily-derived custom tokens that shorten context, and serializes/deserializes the current token-compression ledger so it can be sent/received by a llama.cpp endpoint at any time."
+
+[lib]
+name = "ternary_ledger"
+
+[dependencies]
+# Zero required runtime deps: pure-std for the core (like llcd-control). A
+# JSON/hash map is provided here only if needed; the wire format below is a
+# compact binary (varints) so no serde dependency is required for the core.
