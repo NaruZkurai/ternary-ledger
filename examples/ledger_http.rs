@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use ternary_ledger::{Ledger, LedgerConfig, TernaryCode, wire};
 
-const ADDR: &str = "127.0.0.1:8791";
+const ADDR: &str = "0.0.0.0:8791";
 
 fn handle(led: Arc<Mutex<Ledger>>, mut stream: TcpStream) {
     let mut raw = Vec::new();
