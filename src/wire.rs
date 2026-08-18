@@ -75,20 +75,55 @@ pub fn encode(ledger: &Ledger) -> Vec<u8> {
     let entries = ledger.entries();
     put_varint(&mut out, entries.len() as u64);
     for t in &entries {
-        put_varint(&mut out, t.id as u64);
-        put_varint(&mut out, t.frequency as u64);
-        put_f32(&mut out, t.viability);
-        put_varint(&mut out, t.pattern.len() as u64);
-        for &p in &t.pattern {
-            put_u32(&mut out, p);
-        }
-        put_varint(&mut out, t.code.v.len() as u64);
-        for &c in &t.code.v {
-            out.push(c as u8);
-        }
+        put_entry(&mut out, t);
     }
     put_u32(&mut out, TRAILER);
     out
+}
+
+// Shared per-entry byte layout, used by both the full-ledger encoder and the
+// single-entry `/mint_e_token/` payload: `{eid, oid..., formula}`.
+fn put_entry(out: &mut Vec<u8>, t: &GeneratedToken) {
+    put_varint(out, t.id as u64); // eid
+    put_varint(out, t.frequency as u64);
+    put_f32(out, t.viability);
+    put_varint(out, t.pattern.len() as u64); // oid tuple length
+    for &p in &t.pattern {
+        put_u32(out, p); // oid...
+    }
+    put_varint(out, t.code.v.len() as u64); // formula (ternary code) length
+    for &c in &t.code.v {
+        out.push(c as u8); // formula values in {-1,0,+1}
+    }
+}
+
+/// Encode a single etoken entry — the `/mint_e_token/` payload
+/// `{eid: {oid..., formula}}`. A server that replied "unknown etoken in ledger"
+/// receives one of these to mint the etoken on the fly.
+pub fn encode_entry(t: &GeneratedToken) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_entry(&mut out, t);
+    out
+}
+
+/// Decode a single etoken entry from [`encode_entry`]. Returns it verbatim —
+/// no ledger, no config, just the one `{eid, oid..., formula}` record.
+pub fn decode_entry(bytes: &[u8]) -> Result<GeneratedToken, WireError> {
+    let mut r = Reader { b: bytes, pos: 0 };
+    let eid = r.varint()? as u32;
+    let frequency = r.varint()? as u32;
+    let viability = r.f32()?;
+    let pattern_len = r.varint()? as usize;
+    let mut oid = Vec::with_capacity(pattern_len);
+    for _ in 0..pattern_len {
+        oid.push(r.u32()?);
+    }
+    let code_len = r.varint()? as usize;
+    let mut cv = Vec::with_capacity(code_len);
+    for _ in 0..code_len {
+        cv.push(r.u8()? as i8);
+    }
+    Ok(GeneratedToken { id: eid, pattern: oid, code: TernaryCode::new(cv), frequency, viability })
 }
 
 // --- decoding helpers ---
@@ -150,6 +185,7 @@ pub fn decode(bytes: &[u8]) -> Result<Ledger, WireError> {
     let n_code = r.varint()? as usize;
     let n_entries = r.varint()? as usize;
     let mut ledger = Ledger::new(LedgerConfig { n_vocab, n_window, n_code, ..LedgerConfig::default() });
+    let mut entries = Vec::with_capacity(n_entries);
     for _ in 0..n_entries {
         let id = r.varint()? as u32;
         let frequency = r.varint()? as u32;
@@ -164,9 +200,9 @@ pub fn decode(bytes: &[u8]) -> Result<Ledger, WireError> {
         for _ in 0..code_len {
             cv.push(r.u8()? as i8);
         }
-        ledger
-            .add_raw(GeneratedToken { id, pattern, code: TernaryCode::new(cv), frequency, viability });
+        entries.push(GeneratedToken { id, pattern, code: TernaryCode::new(cv), frequency, viability });
     }
+    ledger.load_entries(entries);
     if r.u32()? != TRAILER {
         return Err(WireError("bad trailer".into()));
     }
@@ -180,16 +216,29 @@ mod tests {
     #[test]
     fn roundtrip() {
         let mut led = Ledger::new(LedgerConfig { n_vocab: 1000, n_window: 4, n_code: 8, ..LedgerConfig::default() });
-        let w: Vec<u32> = vec![10, 20, 30, 40];
-        led.register_pattern(&w);
-        led.set_entry(led.lookup_pattern(&w).unwrap(), TernaryCode::new(vec![1, -1, 0, 1, 1, 0, -1, 1]), 0.87);
+        led.load_entries(vec![
+            GeneratedToken { id: 400_000, pattern: vec![10, 20, 30, 40], code: TernaryCode::new(vec![1, -1, 0, 1, 1, 0, -1, 1]), frequency: 2, viability: 0.87 },
+        ]);
         let bytes = encode(&led);
         let back = decode(&bytes).unwrap();
         assert_eq!(back.config().n_vocab, 1000);
         assert_eq!(back.len(), 1);
-        let e = back.entries();
-        assert_eq!(e[0].pattern, w);
-        assert_eq!(e[0].code.dim(), 8);
-        assert!((e[0].viability - 0.87).abs() < 1e-6);
+        assert!(back.contains(400_000));
+        let e = back.get_by_id(400_000).unwrap();
+        assert_eq!(e.pattern, vec![10, 20, 30, 40]);
+        assert_eq!(e.code.dim(), 8);
+        assert!((e.viability - 0.87).abs() < 1e-6);
+    }
+
+    #[test]
+    fn single_entry_roundtrip() {
+        // The `/mint_e_token/` payload: {eid: {oid..., formula}}
+        let t = GeneratedToken { id: 777_001, pattern: vec![1, 2, 3], code: TernaryCode::new(vec![1, 0, -1, 1, -1, 0, 0, 1]), frequency: 1, viability: 0.6 };
+        let bytes = encode_entry(&t);
+        let back = decode_entry(&bytes).unwrap();
+        assert_eq!(back.id, 777_001);
+        assert_eq!(back.pattern, vec![1, 2, 3]);
+        assert_eq!(back.code.v, vec![1, 0, -1, 1, -1, 0, 0, 1]);
+        assert!((back.viability - 0.6).abs() < 1e-6);
     }
 }

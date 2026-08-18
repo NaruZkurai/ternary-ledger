@@ -7,11 +7,20 @@
 //! on-the-wire context: instead of sending an `n_window`-long sequence, the
 //! harness sends one ledger-backed token id.
 //!
-//! The ledger is *dynamic*: minting happens as patterns recur, viabilities
-//! update, and stale/low-viability entries can be pruned. It is also
-//! serializable — the current full ledger can be sent to / received from a
-//! llama.cpp endpoint at any time via the compact binary wire format in
-//! [`crate::wire`].
+//! The ledger is an **array of formulas for the minted custom etokens**. It is
+//! fed from two directions, sharing one entry type and one wire format:
+//!
+//! * **External** — the etoken definitions are authored outside the crate and
+//!   handed in via [`Ledger::load_entries`] (or `POST /ledger` over HTTP).
+//!   Entries keep whatever `id >= n_vocab` was assigned externally; no id is
+//!   auto-derived.
+//! * **Internal** — the crate derives an etoken itself from a raw window via
+//!   [`Ledger::mint_pattern`], producing the same [`GeneratedToken`] record.
+//!
+//! Either way each entry is `{id, pattern, code, frequency, viability}`, exactly
+//! mirroring the fork's `tcomp::generated_token`, and serializes through the
+//! `TLDG` wire format in [`crate::wire`] so the current ledger can be sent to /
+//! received from a llama.cpp endpoint at any time.
 //!
 //! @module ternary-ledger/ledger
 
@@ -118,10 +127,33 @@ impl Ledger {
         self.map.get(&key).map(|t| t.id)
     }
 
-    /// Mint or refresh an entry for the given window. If the pattern already has
-    /// a token, bumps its frequency. Otherwise a new id (`>= n_vocab`) is minted
-    /// with a placeholder viability that a decoder would later refine.
-    pub fn register_pattern(&mut self, pattern: &[u32]) -> u32 {
+    /// --- EXTERNAL path ---
+    ///
+    /// Load an externally-authored array of etoken definitions wholesale,
+    /// replacing the previous contents. Each entry keeps whatever `id >=
+    /// n_vocab` it was given; no id is auto-assigned. This is the "give / create
+    /// externally" path — the ledger is an input table of formulas, and is what
+    /// `POST /ledger` deserializes into.
+    pub fn load_entries(&mut self, entries: Vec<GeneratedToken>) {
+        self.map.clear();
+        for t in entries {
+            let key = pattern_hash(&t.pattern);
+            if t.id >= self.next_id {
+                self.next_id = t.id + 1;
+            }
+            self.map.insert(key, t);
+        }
+    }
+
+    /// --- INTERNAL path ---
+    ///
+    /// Derive an etoken from a raw window and add it to the ledger, returning
+    /// its minted id (`>= n_vocab`). On repeat windows the existing entry's
+    /// frequency is bumped and its id returned (mint is idempotent per pattern).
+    /// The caller supplies the ternary `code` and `viability` for the pattern —
+    /// the internal producer of those is a host trainer that fed the layer; this
+    /// method only marshals the window + code into a ledger record.
+    pub fn mint_pattern(&mut self, pattern: &[u32], code: TernaryCode, viability: f32) -> u32 {
         if pattern.len() != self.cfg.n_window {
             return u32::MAX; // caller must supply exact-window patterns
         }
@@ -136,9 +168,6 @@ impl Ledger {
         }
         let id = self.next_id;
         self.next_id += 1;
-        // A default "cold" code: zeros are revocable; a decoder/PP server that
-        // actually trains the layer would replace this with the learned code.
-        let code = TernaryCode::new(vec![0; self.cfg.n_code]);
         self.map.insert(
             key,
             GeneratedToken {
@@ -146,23 +175,10 @@ impl Ledger {
                 pattern: pattern.to_vec(),
                 code,
                 frequency: 1,
-                viability: 0.5,
+                viability,
             },
         );
         id
-    }
-
-    /// Update the ternary code + viability for an existing minted id.
-    /// Returns false if the id is not in the ledger.
-    pub fn set_entry(&mut self, id: u32, code: TernaryCode, viability: f32) -> bool {
-        for (_k, tok) in self.map.iter_mut() {
-            if tok.id == id {
-                tok.code = code;
-                tok.viability = viability;
-                return true;
-            }
-        }
-        false
     }
 
     /// All current minted entries, in stable (sorted-by-id) order.
@@ -172,14 +188,59 @@ impl Ledger {
         v
     }
 
-    /// Insert a raw entry verbatim (used by the wire decoder / receiving a
-    /// ledger). Replaces any entry with the same id.
-    pub fn add_raw(&mut self, tok: GeneratedToken) {
-        let key = pattern_hash(&tok.pattern);
-        if tok.id >= self.next_id {
-            self.next_id = tok.id + 1;
+    /// Look up an entry by minted id, if present.
+    pub fn get_by_id(&self, id: u32) -> Option<&GeneratedToken> {
+        self.map.values().find(|t| t.id == id)
+    }
+
+    /// Recognition check: does the ledger already know this minted id?
+    ///
+    /// This is what lets a server answer "unknown etoken in ledger" for an
+    /// id >= n_vocab it has not yet seen, versus "recognized" for one already
+    /// minted.
+    pub fn contains(&self, id: u32) -> bool {
+        self.map.values().any(|t| t.id == id)
+    }
+
+    /// --- DYNAMIC path (e.g. `/mint_e_token/`) ---
+    ///
+    /// Register an etoken with an **externally-specified** minted id — the
+    /// caller chose `eid` (id >= n_vocab), not this crate. `eid` maps to the
+    /// original token(s) it represents (`oid` tuple) and its ternary `formula`.
+    ///
+    /// This is the on-the-fly mint a server performs when it receives
+    /// `{eid: {oid..., formula}}` after replying "unknown etoken in ledger".
+    ///
+    /// Returns false if `eid` is already minted or is below n_vocab (not an
+    /// etoken id). Callers should keep the LEDGER KEYED BY ID model in mind:
+    /// `oid...` is the pattern the etoken decodes back to; the server stores
+    /// the etoken in KV *as the etoken*, using `formula` (the code) as its KV
+    /// value.
+    pub fn mint_external(&mut self, eid: u32, oid: Vec<u32>, formula: TernaryCode) -> bool {
+        if eid < self.cfg.n_vocab {
+            return false; // not an etoken id
         }
-        self.map.insert(key, tok);
+        if self.contains(eid) {
+            return false; // already minted
+        }
+        if self.map.len() >= self.cfg.max_entries {
+            self.evict_lowest_viability();
+        }
+        let key = pattern_hash(&oid);
+        if eid >= self.next_id {
+            self.next_id = eid + 1;
+        }
+        self.map.insert(
+            key,
+            GeneratedToken {
+                id: eid,
+                pattern: oid,
+                code: formula,
+                frequency: 1,
+                viability: 0.5,
+            },
+        );
+        true
     }
 
     fn evict_lowest_viability(&mut self) {
@@ -201,15 +262,48 @@ impl Ledger {
 mod tests {
     use super::*;
 
+    fn code(v: &[i8]) -> TernaryCode {
+        TernaryCode::new(v.to_vec())
+    }
+
     #[test]
-    fn mints_and_reuses() {
+    fn internal_mint_and_reuse() {
         let mut l = Ledger::new(LedgerConfig::default());
         let win: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let id1 = l.register_pattern(&win);
+        let id1 = l.mint_pattern(&win, code(&[1, -1, 0, 1, 1, 0, -1, 1]), 0.8);
         assert!(id1 >= l.config().n_vocab);
-        let id2 = l.register_pattern(&win); // same pattern -> reuse
+        let id2 = l.mint_pattern(&win, code(&[1, -1, 0, 1, 1, 0, -1, 1]), 0.8); // same pattern -> reuse
         assert_eq!(id1, id2);
         assert_eq!(l.lookup_pattern(&win), Some(id1));
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn external_load_keeps_ids() {
+        let mut l = Ledger::new(LedgerConfig { n_vocab: 1000, n_window: 4, n_code: 8, ..LedgerConfig::default() });
+        l.load_entries(vec![
+            GeneratedToken { id: 100_500, pattern: vec![10, 20, 30, 40], code: code(&[1, 0, -1, 1, 1, -1, 0, 1]), frequency: 3, viability: 0.9 },
+            GeneratedToken { id: 777_010, pattern: vec![1, 1, 2, 2], code: code(&[0, 0, 1, -1, 1, 1, 0, -1]), frequency: 1, viability: 0.4 },
+        ]);
+        // Externally-assigned ids are preserved verbatim.
+        assert!(l.get_by_id(100_500).is_some());
+        assert!(l.get_by_id(777_010).is_some());
+        assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_mint_external_and_contains() {
+        let mut l = Ledger::new(LedgerConfig { n_vocab: 1000, n_window: 3, n_code: 8, ..LedgerConfig::default() });
+        // Id not in ledger yet -> "unknown etoken in ledger"
+        assert!(!l.contains(400_000));
+        // Mint it on the fly: {eid: {oid..., formula}}
+        let ok = l.mint_external(400_000, vec![5, 6, 7], code(&[1, -1, 0, 1, 1, 0, -1, 1]));
+        assert!(ok);
+        assert!(l.contains(400_000));
+        assert_eq!(l.get_by_id(400_000).unwrap().pattern, vec![5, 6, 7]);
+        // Duplicate mint rejected; id below n_vocab rejected.
+        assert!(!l.mint_external(400_000, vec![8, 9, 10], code(&[0; 8])));
+        assert!(!l.mint_external(900, vec![1, 2, 3], code(&[0; 8])));
         assert_eq!(l.len(), 1);
     }
 
@@ -218,14 +312,14 @@ mod tests {
         let mut cfg = LedgerConfig::default();
         cfg.max_entries = 2;
         let mut l = Ledger::new(cfg);
-        l.register_pattern(&[1, 1, 1, 1, 1, 1, 1, 1]);
-        l.register_pattern(&[2, 2, 2, 2, 2, 2, 2, 2]);
+        l.mint_pattern(&[1, 1, 1, 1, 1, 1, 1, 1], code(&[0; 64]), 0.5);
+        l.mint_pattern(&[2, 2, 2, 2, 2, 2, 2, 2], code(&[0; 64]), 0.99);
         // make the first entry low viability, then a third forces eviction
         let first = l.entries()[0].id;
-        l.set_entry(first, TernaryCode::new(vec![0; 64]), 0.01);
-        let w3: Vec<u32> = vec![3, 3, 3, 3, 3, 3, 3, 3];
-        l.register_pattern(&w3);
-        assert_eq!(l.len(), 2);
-        assert_eq!(l.lookup_pattern(&w3), Some(l.entries().last().unwrap().id));
+        let low = l.get_by_id(first).unwrap().clone();
+        l.load_entries(vec![low, l.entries()[1].clone()]);
+        l.evict_lowest_viability();
+        assert_eq!(l.len(), 1);
+        assert!(!l.contains(first));
     }
 }
