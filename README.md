@@ -12,9 +12,12 @@ and low-viability / stale entries get pruned. It is fully serializable so the
 **current ledger can be sent to / received from a llama.cpp endpoint at any
 time** through the compact binary wire format in `src/wire.rs`.
 
-This is the clean Rust replacement for the fork's imperfect C++ `tools/tcomp`
-experiment (which had no server wiring, no sampler hook, and no defined wire
-format).
+This crate is **standalone** — its own package and git repo — and is **not** part
+of llama.cpp. It is the clean Rust replacement for the fork's imperfect C++
+`tools/tcomp` experiment (which had no server wiring, no sampler hook, and no
+defined wire format). Wiring it into the llama.cpp server is future work (see
+Roadmap); today it talks to a llama.cpp endpoint only over plain HTTP.
+
 
 ## Crate layout
 
@@ -55,12 +58,13 @@ Magic + version + config + entries, with LEB128 varints for counts/ints:
 
 ## Send / receive the ledger over HTTP
 
-`examples/ledger_http.rs` is a dependency-free endpoint on `127.0.0.1:8791`:
+`examples/ledger_http.rs` is a dependency-free endpoint bound to `0.0.0.0:8791`
+(listens on all interfaces, so it is reachable off-loopback):
 
 ```
 cargo run --example ledger_http
-curl  http://127.0.0.1:8791/ledger -o ledger.bin      # receive
-curl -X POST --data-binary @ledger.bin http://127.0.0.1:8791/ledger  # send
+curl  http://<host>:8791/ledger -o ledger.bin          # receive
+curl -X POST --data-binary @ledger.bin http://<host>:8791/ledger  # send
 ```
 
 GET returns the binary ledger; POST replaces the in-memory ledger (validated by
@@ -100,5 +104,6 @@ cargo test   # mints_and_reuses, evicts_below_cap, wire roundtrip
 ## Status
 
 Core + wire + HTTP demo complete and verified end-to-end (GET/POST roundtrip,
-115-byte `TLDG` payload). Fork endpoint wiring and GPU decode hook = open design
-(see Roadmap).
+115-byte `TLDG` payload; endpoint bound to `0.0.0.0:8791`). The crate is
+standalone and pushed to `NaruZkurai/ternary-ledger`. Fork endpoint wiring and
+GPU decode hook = open design (see Roadmap).
