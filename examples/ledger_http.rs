@@ -4,6 +4,7 @@
 //! Endpoints a llama.cpp server would host:
 //!   GET  /ledger           -> binary ledger bytes ("receive the current ledger")
 //!   POST /ledger           -> upload a ledger, replaces the in-memory one ("send")
+//!   GET  /build-status     -> "built" / "building" state for a connecting user
 //!   GET  /check/{id}       -> "recognized" or "unknown etoken in ledger"
 //!   POST /mint_e_token/    -> mint an etoken on the fly from {eid: {oid..., formula}}
 //!
@@ -55,6 +56,43 @@ fn respond(stream: &mut TcpStream, status: &str, body: &[u8]) {
     let _ = stream.write_all(&out);
 }
 
+/// Path to the status file written by `scripts/build-and-notify.sh`, reporting
+/// the build state of BOTH crates: the ledger endpoint and the gigatoken addon.
+const STATUS_FILE: &str = "/tmp/pi-crates-build-state";
+
+/// Body for GET /build-status — tells a connecting user whether the crates are
+/// built yet or still building (`ledger=`/`addon=`), plus their built paths.
+fn build_status_body() -> String {
+    let mut ledger = String::from("building"); // default while the file is absent
+    let mut ledger_path = String::new();
+    let mut addon = String::from("building");
+    let mut addon_path = String::new();
+    if let Ok(text) = std::fs::read_to_string(STATUS_FILE) {
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("ledger=") {
+                ledger = v.to_string();
+            } else if let Some(v) = line.strip_prefix("ledger_path=") {
+                ledger_path = v.to_string();
+            } else if let Some(v) = line.strip_prefix("addon=") {
+                addon = v.to_string();
+            } else if let Some(v) = line.strip_prefix("addon_path=") {
+                addon_path = v.to_string();
+            }
+        }
+    }
+    let tl = if ledger_path.is_empty() {
+        format!("ledger: {ledger}")
+    } else {
+        format!("ledger: {ledger} ({ledger_path})")
+    };
+    let ga = if addon_path.is_empty() {
+        format!("addon: {addon}")
+    } else {
+        format!("addon: {addon} ({addon_path})")
+    };
+    format!("{tl}\n{ga}\n")
+}
+
 fn handle(led: Arc<Mutex<Ledger>>, mut stream: TcpStream) {
     let (method, path, body) = read_request(&mut stream);
 
@@ -72,6 +110,11 @@ fn handle(led: Arc<Mutex<Ledger>>, mut stream: TcpStream) {
             }
             Err(e) => respond(&mut stream, "400 Bad Request", format!("bad ledger: {e}").as_bytes()),
         }
+        return;
+    }
+    // GET /build-status — "built vs building" for a connecting user.
+    if method == "GET" && path == "/build-status" {
+        respond(&mut stream, "200 OK", build_status_body().as_bytes());
         return;
     }
     // GET /check/{id} — recognition check.
